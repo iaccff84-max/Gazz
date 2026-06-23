@@ -115,6 +115,8 @@ class DiscordVoiceBot:
         self.audio_processor = AudioProcessor()
         self.audio_playing = False
         self.audio_thread = None
+        self.music_volume = 0.7  # 70% volume
+        self.loop_music = False  # Có loop hay không
         
     def on_message(self, ws, message):
         """Xử lý message từ Discord Gateway"""
@@ -211,29 +213,46 @@ class DiscordVoiceBot:
             self.voice_connected = False
 
     def send_audio_data(self, audio_file):
-        """Gửi audio data qua UDP socket"""
+        """Gửi audio data qua UDP socket với loop và volume control"""
         try:
             if not os.path.exists(audio_file):
                 print(f"{Fore.RED}✗ File audio không tồn tại{Style.RESET_ALL}")
                 return
             
-            with open(audio_file, 'rb') as f:
-                # Bỏ qua WAV header (44 bytes)
-                f.seek(44)
-                self.audio_playing = True
-                
-                frame_size = 3840  # 48kHz * 20ms * 2 bytes * 2 channels
-                
-                while self.running and self.audio_playing and self.voice_connected:
-                    audio_chunk = f.read(frame_size)
-                    if not audio_chunk:
-                        break
+            self.audio_playing = True
+            loop_count = 0
+            max_loops = 5 if self.loop_music else 1  # Loop 5 lần nếu enabled
+            
+            while self.running and self.audio_playing and self.voice_connected and loop_count < max_loops:
+                try:
+                    with open(audio_file, 'rb') as f:
+                        # Bỏ qua WAV header (44 bytes)
+                        f.seek(44)
+                        
+                        frame_size = 3840  # 48kHz * 20ms * 2 bytes * 2 channels
+                        
+                        while self.running and self.audio_playing and self.voice_connected:
+                            audio_chunk = f.read(frame_size)
+                            if not audio_chunk:
+                                break
+                            
+                            # Áp dụng volume control
+                            audio_data = self._apply_volume(audio_chunk)
+                            
+                            try:
+                                self.udp_socket.sendto(audio_data, (self.voice_ip, self.voice_port))
+                                time.sleep(0.02)  # 20ms delay
+                            except Exception as e:
+                                self.audio_playing = False
+                                break
                     
-                    try:
-                        self.udp_socket.sendto(audio_chunk, (self.voice_ip, self.voice_port))
-                        time.sleep(0.02)  # 20ms delay
-                    except Exception as e:
-                        break
+                    loop_count += 1
+                    if loop_count < max_loops:
+                        print(f"{Fore.LIGHTYELLOW_EX}⟳ Lặp lại: {loop_count}/{max_loops}{Style.RESET_ALL}")
+                        time.sleep(0.5)  # Chờ trước khi loop lại
+                        
+                except Exception as e:
+                    break
             
             self.audio_playing = False
             print(f"{Fore.LIGHTGREEN_EX}✓ Phát nhạc hoàn thành{Style.RESET_ALL}")
@@ -248,28 +267,61 @@ class DiscordVoiceBot:
             print(f"{Fore.RED}✗ Lỗi phát nhạc: {str(e)}{Style.RESET_ALL}")
             self.audio_playing = False
 
-    def play_music(self, music_file):
+    def _apply_volume(self, audio_chunk):
+        """Điều chỉnh âm lượng của audio chunk"""
+        try:
+            import array
+            # Convert bytes to signed short array
+            audio_array = array.array('h')
+            audio_array.frombytes(audio_chunk)
+            
+            # Apply volume multiplier
+            volume_multiplier = self.music_volume
+            for i in range(len(audio_array)):
+                # Giới hạn trong khoảng -32768 đến 32767
+                sample = int(audio_array[i] * volume_multiplier)
+                audio_array[i] = max(-32768, min(32767, sample))
+            
+            return audio_array.tobytes()
+        except:
+            # Nếu có lỗi, trả về chunk gốc
+            return audio_chunk
+
+    def play_music(self, music_file, loop=False):
         """Phát nhạc"""
         if self.audio_playing:
             print(f"{Fore.YELLOW}⚠ Đang phát nhạc, vui lòng chờ{Style.RESET_ALL}")
             return
         
+        # Chờ voice kết nối (tối đa 5 giây)
         if not self.voice_connected:
-            print(f"{Fore.YELLOW}⚠ Voice chưa sẵn sàng, chờ 2 giây...{Style.RESET_ALL}")
-            time.sleep(2)
+            print(f"{Fore.YELLOW}⚠ Chờ voice kết nối...{Style.RESET_ALL}")
+            for i in range(50):  # 50 * 0.1s = 5 giây
+                time.sleep(0.1)
+                if self.voice_connected:
+                    print(f"{Fore.LIGHTGREEN_EX}✓ Voice đã kết nối!{Style.RESET_ALL}")
+                    break
+            
             if not self.voice_connected:
-                print(f"{Fore.RED}✗ Chưa kết nối voice{Style.RESET_ALL}")
+                print(f"{Fore.RED}✗ Chưa kết nối voice sau 5 giây{Style.RESET_ALL}")
                 return
         
+        self.loop_music = loop
         print(f"{Fore.LIGHTBLUE_EX}► Đang chuẩn bị nhạc...{Style.RESET_ALL}")
         
         audio_file = self.audio_processor.prepare_audio(music_file)
         if audio_file:
-            print(f"{Fore.LIGHTGREEN_EX}► Bắt đầu phát nhạc: {os.path.basename(music_file)}{Style.RESET_ALL}")
+            loop_text = " (Loop)" if loop else ""
+            print(f"{Fore.LIGHTGREEN_EX}► Bắt đầu phát nhạc: {os.path.basename(music_file)}{loop_text}{Style.RESET_ALL}")
             self.audio_thread = threading.Thread(target=self.send_audio_data, args=(audio_file,), daemon=True)
             self.audio_thread.start()
         else:
             print(f"{Fore.RED}✗ Không thể chuẩn bị file nhạc{Style.RESET_ALL}")
+
+    def set_music_volume(self, volume):
+        """Đặt âm lượng nhạc (0.0 - 1.0)"""
+        self.music_volume = max(0.0, min(1.0, volume))
+        print(f"{Fore.LIGHTYELLOW_EX}🔊 Âm lượng: {int(self.music_volume * 100)}%{Style.RESET_ALL}")
 
     def identify(self):
         """Gửi IDENTIFY payload - Discord API v10"""
@@ -578,7 +630,9 @@ def show_music_menu(bot):
             return
         elif 1 <= choice_num <= len(music_files):
             selected_music = music_files[choice_num - 1]
-            bot.play_music(selected_music)
+            loop_choice = input(f"{Fore.LIGHTBLUE_EX}Bật loop? (c/n): {Style.RESET_ALL}").strip().lower()
+            loop = loop_choice == 'c'
+            bot.play_music(selected_music, loop=loop)
         else:
             print(f"{Fore.RED}✗ Lựa chọn không hợp lệ{Style.RESET_ALL}")
     except ValueError:
@@ -588,7 +642,7 @@ def show_music_menu(bot):
 
 def main():
     print(f"{Fore.LIGHTCYAN_EX}╔════════════════════════════════════════════╗")
-    print(f"║  {Fore.LIGHTMAGENTA_EX}Discord Voice Bot v6 (Phát Nhạc){Fore.LIGHTCYAN_EX}        ║")
+    print(f"║  {Fore.LIGHTMAGENTA_EX}Discord Voice Bot v7 (Loop Music){Fore.LIGHTCYAN_EX}        ║")
     print(f"║  {Fore.LIGHTGREEN_EX}Gateway v10 + Voice v9 + Live Streaming{Fore.LIGHTCYAN_EX}  ║")
     print(f"╚════════════════════════════════════════════╝{Style.RESET_ALL}\n")
     
@@ -653,8 +707,8 @@ def main():
     print(f"║  {Fore.LIGHTGREEN_EX}[1]{Fore.LIGHTCYAN_EX} Tắt Mic    {Fore.LIGHTGREEN_EX}[2]{Fore.LIGHTCYAN_EX} Bật Mic        ║")
     print(f"║  {Fore.LIGHTGREEN_EX}[3]{Fore.LIGHTCYAN_EX} Tắt Loa    {Fore.LIGHTGREEN_EX}[4]{Fore.LIGHTCYAN_EX} Bật Loa        ║")
     print(f"║  {Fore.LIGHTGREEN_EX}[5]{Fore.LIGHTCYAN_EX} Bắt Live   {Fore.LIGHTGREEN_EX}[8]{Fore.LIGHTCYAN_EX} Phát Nhạc      ║")
-    print(f"║  {Fore.LIGHTGREEN_EX}[6]{Fore.LIGHTCYAN_EX} Tắt Loa+Mic+Live     {Fore.LIGHTGREEN_EX}[0]{Fore.LIGHTCYAN_EX} Thoát      ║")
-    print(f"║  {Fore.LIGHTGREEN_EX}[7]{Fore.LIGHTCYAN_EX} Bật Mic+Loa+Live                    ║")
+    print(f"║  {Fore.LIGHTGREEN_EX}[6]{Fore.LIGHTCYAN_EX} Tắt Loa+Mic+Live     {Fore.LIGHTGREEN_EX}[9]{Fore.LIGHTCYAN_EX} Vol Nhạc   ║")
+    print(f"║  {Fore.LIGHTGREEN_EX}[7]{Fore.LIGHTCYAN_EX} Bật Mic+Loa+Live     {Fore.LIGHTGREEN_EX}[0]{Fore.LIGHTCYAN_EX} Thoát      ║")
     print(f"╚════════════════════════════════════════════╝{Style.RESET_ALL}\n")
 
     try:
@@ -696,6 +750,12 @@ def main():
                     save_config(guild_id, channel_id, False, False)
                 elif cmd == "8":
                     show_music_menu(bot)
+                elif cmd == "9":
+                    try:
+                        vol = float(input(f"{Fore.LIGHTBLUE_EX}Âm lượng (0-100): {Style.RESET_ALL}"))
+                        bot.set_music_volume(vol / 100)
+                    except ValueError:
+                        print(f"{Fore.RED}✗ Nhập số từ 0-100{Style.RESET_ALL}")
                 elif cmd == "0":
                     print(f"{Fore.YELLOW}⚠ Đang thoát...{Style.RESET_ALL}")
                     bot.running = False
